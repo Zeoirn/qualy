@@ -46,7 +46,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The single event name this app ever sends.
 const EVENT_NAME: &str = "app_started";
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemProps {
     os_name: String,
@@ -57,7 +57,7 @@ struct SystemProps {
     sdk_version: String,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Event {
     timestamp: String,
@@ -81,9 +81,16 @@ fn host_for_key(app_key: &str) -> &'static str {
     if app_key.contains("-EU-") { "https://eu.aptabase.com" } else { "https://us.aptabase.com" }
 }
 
+/// Ingest URL for an ingest host. The path is Aptabase's documented v0
+/// events endpoint (plural `events`, taking an array body; singular 404s).
+fn events_url_for_host(host: &str) -> String {
+    format!("{host}/api/v0/events")
+}
+
 /// Full ingest URL for an app key.
+#[cfg(test)]
 fn events_url(app_key: &str) -> String {
-    format!("{}/api/v0/events", host_for_key(app_key))
+    events_url_for_host(host_for_key(app_key))
 }
 
 /// Aptabase's required session id shape: epoch seconds followed by exactly 8
@@ -113,27 +120,31 @@ fn os_name() -> String {
 /// sent, and must never surface to the user.
 #[cfg(target_os = "windows")]
 fn os_version() -> String {
-    use winreg::RegKey;
     use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
 
     // `CurrentBuild` rather than `CurrentVersion`: since Windows 8.1 the
     // latter is frozen at 6.3 for compatibility, so it cannot distinguish
     // Windows 10 from 11. The build number is what actually moves.
-    let key = match
-        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(
-            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
-        )
+    let key = match RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
     {
         Ok(key) => key,
-        Err(_) => {
-            return String::new();
-        }
+        Err(_) => return String::new(),
     };
 
-    let build: String = key.get_value("CurrentBuild").unwrap_or_default();
-    let major = if build.parse::<u32>().unwrap_or(0) >= 22000 { "11" } else { "10" };
+    let build: u32 = key.get_value("CurrentBuild").unwrap_or(0);
+    if build == 0 {
+        return String::new();
+    }
 
-    if build.is_empty() { String::new() } else { format!("{major}.0.{build}") }
+    // `UBR` (update build revision) is the patch segment. Reading it turns
+    // "10.0.19045" into "10.0.19045.5011", which is what dashboards can
+    // actually segment on. It is optional: older or exotic builds omit it.
+    let ubr: u32 = key.get_value("UBR").unwrap_or(0);
+    let major = if build >= 22000 { "11" } else { "10" };
+
+    if ubr > 0 { format!("{major}.0.{build}.{ubr}") } else { format!("{major}.0.{build}") }
 }
 
 /// Best-effort OS version on Unix. `uname -r` on Linux and `sw_vers` on
@@ -146,8 +157,7 @@ fn os_version() -> String {
         ("uname", &["-r"])
     };
 
-    std::process::Command
-        ::new(program)
+    std::process::Command::new(program)
         .args(args)
         .output()
         .ok()
@@ -225,21 +235,63 @@ fn should_send(app_key: &str, telemetry_enabled: bool) -> bool {
 /// Performs the blocking POST. Returns the HTTP status so callers and
 /// integration tests can assert on it; every error is mapped to a string and
 /// nothing is ever propagated to the user.
-fn send_blocking(app_key: &str, event: &Event) -> Result<u16, String> {
-    let client = reqwest::blocking::Client
-        ::builder()
+fn post_events(url: &str, app_key: &str, event: &Event) -> Result<u16, String> {
+    let client = reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
 
     let response = client
-        .post(events_url(app_key))
+        .post(url)
         .header("App-Key", app_key)
         .json(&[event])
         .send()
         .map_err(|e| e.to_string())?;
 
     Ok(response.status().as_u16())
+}
+
+/// The production send path: real host, real key.
+#[cfg(test)]
+fn send_blocking(app_key: &str, event: &Event) -> Result<u16, String> {
+    post_events(&events_url(app_key), app_key, event)
+}
+
+/// The sender half of a report, moved onto the telemetry thread. Injected so
+/// tests exercise the exact same spawn-then-send path against a local server
+/// instead of the production ingest endpoint.
+type SendFn = Box<dyn FnOnce(&Event) -> Result<u16, String> + Send>;
+
+/// Hands a built event to a sender on a detached thread.
+fn spawn_report(event: Event, send: SendFn) {
+    // Detached on purpose. Nothing joins this thread: if the app exits first
+    // the request is abandoned, which is the correct trade for a metric that
+    // must never delay shutdown.
+    std::thread::Builder::new()
+        .name("telemetry".to_string())
+        .spawn(move || match send(&event) {
+            Ok(status) => {
+                crate::debug_print!("📊 Telemetry {} -> HTTP {}", EVENT_NAME, status);
+            }
+            Err(e) => {
+                // Offline, DNS failure, blocked by a firewall: all
+                // expected and all silent outside debug logging.
+                crate::debug_print!("📊 Telemetry skipped: {}", e);
+            }
+        })
+        .ok();
+}
+
+/// Reports one launch against an explicit key and ingest host, if enabled
+/// and the key is real. The caller's thread does no config read, no DNS, and
+/// no I/O: every gate runs here, then the work moves off-thread.
+fn report_with(app_key: &'static str, host: &str, telemetry_enabled: bool) {
+    if !should_send(app_key, telemetry_enabled) {
+        return;
+    }
+
+    let url = events_url_for_host(host);
+    spawn_report(build_event(), Box::new(move |event| post_events(&url, app_key, event)));
 }
 
 /// Reports a single app launch, if telemetry is enabled and a real app key is
@@ -250,30 +302,7 @@ fn send_blocking(app_key: &str, event: &Event) -> Result<u16, String> {
 /// decided by the caller's already-loaded config and this module never
 /// touches config state or the filesystem.
 pub fn report_app_started(telemetry_enabled: bool) {
-    if !should_send(APP_KEY, telemetry_enabled) {
-        return;
-    }
-
-    // Detached on purpose. Nothing joins this thread: if the app exits first
-    // the request is abandoned, which is the correct trade for a metric that
-    // must never delay shutdown.
-    std::thread::Builder
-        ::new()
-        .name("telemetry".to_string())
-        .spawn(|| {
-            let event = build_event();
-            match send_blocking(APP_KEY, &event) {
-                Ok(status) => {
-                    crate::debug_print!("📊 Telemetry {} -> HTTP {}", EVENT_NAME, status);
-                }
-                Err(e) => {
-                    // Offline, DNS failure, blocked by a firewall: all
-                    // expected and all silent outside debug logging.
-                    crate::debug_print!("📊 Telemetry skipped: {}", e);
-                }
-            }
-        })
-        .ok();
+    report_with(APP_KEY, host_for_key(APP_KEY), telemetry_enabled);
 }
 
 #[cfg(test)]
@@ -307,9 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_key_is_configured_and_routes_to_the_us_host() {
-        // Pins the embedded key so a bad edit cannot silently point the app
-        // at the wrong region or blank the key out.
+    fn the_shipped_key_is_pinned_and_routes_to_the_us_host() {
+        // Pins the embedded key byte-for-byte so a bad edit cannot silently
+        // point the app at the wrong region, blank the key out, or swap in a
+        // different app's dashboard.
+        assert_eq!(APP_KEY, "A-US-6022972570");
         assert!(is_configured(APP_KEY));
         assert_eq!(host_for_key(APP_KEY), "https://us.aptabase.com");
     }
@@ -343,7 +374,8 @@ mod tests {
     #[test]
     fn session_ids_are_not_reused_across_launches() {
         // The anonymity guarantee: nothing here is stable enough to follow a
-        // user across runs.
+        // user across runs. Collision odds are 1e-8 per pair, so a failure
+        // here means the generator is broken, not unlucky.
         let a = new_session_id();
         let b = new_session_id();
         assert_ne!(a, b);
@@ -455,64 +487,146 @@ mod live_tests {
 #[cfg(test)]
 mod off_path_tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{ AtomicUsize, Ordering };
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
-    /// Counts real TCP connections. Proving "off means zero requests" needs a
-    /// socket someone could actually connect to, not a mocked-out seam that
-    /// assumes the answer.
-    fn counting_listener() -> (String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
-        let addr = listener.local_addr().expect("listener has an address").to_string();
-        let hits = Arc::new(AtomicUsize::new(0));
+    /// A minimal stand-in for the Aptabase ingest endpoint: a local TCP
+    /// listener that records every raw HTTP request it receives and answers
+    /// 200 OK. Testing "off means zero requests" and the wire format against
+    /// a real socket, not a mocked-out seam that assumes the answer.
+    struct FakeAptabase {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
 
-        let thread_hits = hits.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if stream.is_err() {
-                    break;
+    impl FakeAptabase {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+            let url = format!("http://{}/api/v0/events", listener.local_addr().expect("listener has an address"));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+
+            let thread_requests = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut stream = stream;
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+
+                    // Read until the end of the headers, then drain however
+                    // many body bytes Content-Length promises.
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        }
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+
+                    if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) {
+                        let headers = String::from_utf8_lossy(&raw[..end]);
+                        let content_length = headers
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split_once(':').and_then(|(_, v)| v.trim().parse::<usize>().ok()))
+                            .unwrap_or(0);
+
+                        while raw.len() < end + content_length {
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                    }
+
+                    thread_requests.lock().expect("request lock").push(String::from_utf8_lossy(&raw).into_owned());
+
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 }
-                thread_hits.fetch_add(1, Ordering::SeqCst);
-            }
-        });
+            });
 
-        (addr, hits)
+            Self { url, requests }
+        }
+
+        fn count(&self) -> usize {
+            self.requests.lock().expect("request lock").len()
+        }
+    }
+
+    /// Waits for the first recorded request with a deadline, instead of a
+    /// fixed sleep: deterministic on a loaded CI box, fast when it is there.
+    fn wait_for_request(requests: &Mutex<Vec<String>>, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(request) = requests.lock().expect("request lock").first() {
+                return Some(request.clone());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
     }
 
     /// The opt-out promise, checked against a live socket: with the setting
-    /// off, `report_app_started` opens no connection to anything.
+    /// off, the report path opens no connection and builds no thread work.
     #[test]
     fn the_setting_being_off_opens_no_connection() {
-        let (addr, hits) = counting_listener();
+        let fake = FakeAptabase::start();
 
-        // Sanity: the counter does register a real connection, so a zero
-        // below means "nothing was sent" rather than "the probe is broken".
-        std::net::TcpStream::connect(&addr).expect("control connection");
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "the probe itself must count connections");
+        report_with(APP_KEY, &fake.url, false);
+        std::thread::sleep(Duration::from_millis(300));
 
-        report_app_started(false);
-        std::thread::sleep(Duration::from_millis(500));
-
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            1,
-            "telemetry disabled must not open a single connection"
-        );
+        assert_eq!(fake.count(), 0, "telemetry disabled must not send a single request");
     }
 
-    /// `report_app_started` must hand back control immediately: it is called
-    /// on the startup path, ahead of the audio engine and the input worker.
+    /// The unconfigured-fork promise: even with the setting on, a placeholder
+    /// key never reaches the network.
     #[test]
-    fn reporting_never_blocks_the_calling_thread() {
-        let start = std::time::Instant::now();
-        report_app_started(true);
+    fn an_unconfigured_key_opens_no_connection() {
+        let fake = FakeAptabase::start();
+
+        report_with(PLACEHOLDER_APP_KEY, &fake.url, true);
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert_eq!(fake.count(), 0, "an unconfigured build must stay silent");
+    }
+
+    /// The enabled path, end to end through the real spawn-then-send
+    /// machinery: exactly one POST, to the documented path, carrying the app
+    /// key header and an array body — and the caller never waits for any of
+    /// it.
+    #[test]
+    fn an_enabled_launch_posts_one_documented_request_and_returns_immediately() {
+        let fake = FakeAptabase::start();
+
+        let start = Instant::now();
+        report_with("A-US-0000000000", &fake.url, true);
         let elapsed = start.elapsed();
 
         assert!(
             elapsed < Duration::from_millis(100),
             "startup must not wait on telemetry, took {elapsed:?}"
         );
+
+        let request = wait_for_request(&fake.requests, Duration::from_secs(5))
+            .expect("one request should arrive within 5s");
+        assert_eq!(fake.count(), 1, "one launch is exactly one request");
+
+        let lowered = request.to_ascii_lowercase();
+        assert!(
+            lowered.starts_with("post /api/v0/events http/1.1"),
+            "request must hit the documented endpoint: {request}"
+        );
+        assert!(
+            lowered.contains("app-key: a-us-0000000000"),
+            "request must carry the App-Key header: {request}"
+        );
+
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("body must be JSON");
+        assert!(parsed.is_array(), "body must be an array of events");
+        assert_eq!(parsed[0]["eventName"], EVENT_NAME, "body must carry app_started");
     }
-      }
+}
