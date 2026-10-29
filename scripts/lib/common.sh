@@ -1,130 +1,204 @@
-# Shared helpers for the bash build/CI scripts. Source it, do not execute it:
+# Shared helpers for bash build/CI scripts. Source it, do not execute it:
 #
 #   source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 #
-# build-windows-installer.ps1 carries its own copy of the toolchain check,
-# because PowerShell cannot source this file.
+# Designed for bash 3.2+ (macOS stock bash compatible) without external tools
+# like `sort -V` or python.
 
-_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-_REPO_ROOT="$(cd "${_COMMON_DIR}/../.." && pwd)"
+# Prevent CDPATH from emitting directory paths on `cd`
+unset CDPATH
 
-# True if version $1 is >= version $2. Compares up to three numeric,
-# dot-separated parts, treating a missing part as 0 and ignoring any suffix, so
-# "1.88" equals "1.88.0" and "1.89.0-nightly" counts as 1.89.0. Plain bash, no
-# `sort -V`, so it also runs under macOS's stock bash 3.2.
+_COMMON_DIR="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Try git root first; fallback to relative directory traversal
+_REPO_ROOT="$(git -C "$_COMMON_DIR" rev-parse --show-toplevel 2>/dev/null || (cd -P -- "${_COMMON_DIR}/../.." && pwd -P))"
+
+# Helper for logging GitHub Actions errors to stderr
+_ci_error() {
+  echo "::error::$*" >&2
+}
+
+# Helper for standard info logging
+_ci_info() {
+  echo "::notice::$*"
+}
+
+# True if version $1 is >= version $2.
+# Compares up to three numeric, dot-separated parts, treating missing parts as 0
+# and stripping any suffix ("1.88" == "1.88.0", "1.89.0-nightly" == 1.89.0).
+# Strips leading zeros to avoid octal interpretation in bash.
 _version_ge() {
   local a="$1" b="$2" i x y
   local -a av bv
   local IFS=.
+
+  # Default missing versions to 0
+  [ -z "$a" ] && a="0"
+  [ -z "$b" ] && b="0"
+
   read -r -a av <<<"$a"
   read -r -a bv <<<"$b"
+
   for i in 0 1 2; do
     x="${av[$i]:-0}"
     y="${bv[$i]:-0}"
+
+    # Strip everything after first non-digit (e.g., "-nightly", "+build")
     x="${x%%[!0-9]*}"
     y="${y%%[!0-9]*}"
+
+    # Default to 0 if empty
     x="${x:-0}"
     y="${y:-0}"
+
+    # Strip leading zeros so bash doesn't treat numbers like 08 as octal
+    x="$((10#$x))"
+    y="$((10#$y))"
+
     [ "$x" -gt "$y" ] && return 0
     [ "$x" -lt "$y" ] && return 1
   done
+
   return 0
 }
 
+# Extracts a top-level or [workspace.package] key from Cargo.toml
+_extract_cargo_toml_key() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+
+  # Match either:
+  # 1. key = "value"
+  # 2. Under [workspace.package] or [package]: key = "value"
+  awk -v k="$key" '
+    BEGIN { in_pkg = 0; found = "" }
+    /^\[(package|workspace\.package)\]/ { in_pkg = 1; next }
+    /^\[/ { in_pkg = 0 }
+    in_pkg && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+      if (match($0, /"[^"]+"/)) {
+        val = substr($0, RSTART + 1, RLENGTH - 2)
+        if (!found) found = val
+      }
+    }
+    # Also support top-level declarations
+    !in_pkg && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+      if (match($0, /"[^"]+"/)) {
+        val = substr($0, RSTART + 1, RLENGTH - 2)
+        if (!found) found = val
+      }
+    }
+    END {
+      if (found) { print found; exit 0 }
+      exit 1
+    }
+  ' "$file"
+}
+
 # Fails unless the Rust in use is at least the `rust-version` declared in
-# Cargo.toml - the crate's minimum supported Rust, which is the floor.
-#
-# It is a floor, not an exact match: any newer compiler is fine. What this
-# catches is a compiler too old to build the crate, which otherwise surfaces late
-# as an unrelated-looking error. Typical causes are an exported RUSTUP_TOOLCHAIN,
-# an outdated default toolchain, or a Rust that does not come from rustup at all.
+# Cargo.toml - the crate's minimum supported Rust (MSRV floor).
 verify_rust_toolchain() {
   local cargo_toml="${_REPO_ROOT}/Cargo.toml"
   local floor got
 
-  floor=$(sed -n 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cargo_toml" | head -n1)
-  if [ -z "$floor" ]; then
-    echo "::error::Cargo.toml has no 'rust-version', so there is no minimum Rust to check against"
+  if [ ! -f "$cargo_toml" ]; then
+    _ci_error "Cargo.toml not found at ${_REPO_ROOT}"
+    return 1
+  fi
+
+  floor=$(_extract_cargo_toml_key "$cargo_toml" "rust-version") || {
+    _ci_error "Cargo.toml has no 'rust-version', so there is no minimum Rust to check against"
+    return 1
+  }
+
+  if ! command -v rustc >/dev/null 2>&1; then
+    _ci_error "rustc is not installed or not in PATH (Cargo.toml requires rust-version ${floor})"
     return 1
   fi
 
   got=$(rustc --version 2>/dev/null | awk '{print $2}' || true)
 
   if [ -z "$got" ] || ! _version_ge "$got" "$floor"; then
-    echo "::error::Rust ${got:-<none>} is active but Cargo.toml requires rust-version ${floor} or newer."
-    echo "  Update it ('rustup update stable'), or check for a RUSTUP_TOOLCHAIN override."
+    _ci_error "Rust ${got:-<unknown>} is active, but Cargo.toml requires rust-version ${floor} or newer."
+    echo "  Update it ('rustup update stable'), or check for an active RUSTUP_TOOLCHAIN override." >&2
     return 1
   fi
 
-  echo "Rust toolchain OK: ${got} (at least rust-version ${floor} from Cargo.toml)"
+  echo "Rust toolchain OK: ${got} (satisfies rust-version ${floor} in Cargo.toml)"
 }
 
 # The Windows auto-updater picks the first release asset whose name contains
-# "x64" AND ends in ".exe". No Linux or macOS asset may ever match, or a rename
-# would break Windows updates silently. Asserted rather than trusted; the same
-# pairing is covered by a unit test in auto_updater.rs.
+# "x64" AND ends in ".exe". Asserts that no Linux or macOS asset ever matches.
 #
 # Usage: assert_no_updater_collision <dir>
 assert_no_updater_collision() {
   local dir="$1" f name status=0
+
+  if [ ! -d "$dir" ]; then
+    _ci_error "Directory '${dir}' does not exist"
+    return 1
+  fi
+
   for f in "$dir"/*; do
     [ -e "$f" ] || continue
     name=$(basename "$f" | tr '[:upper:]' '[:lower:]')
     case "$name" in
       *x64*.exe)
-        echo "::error::asset '${name}' matches the Windows auto-updater filter (contains 'x64' and ends in '.exe')"
+        _ci_error "Asset '${name}' collides with the Windows auto-updater filter (contains 'x64' and ends in '.exe')"
         status=1
         ;;
     esac
   done
+
   return $status
 }
 
-# Prints the release tag for a commit, going by what the REMOTE says rather than
-# by how a CI run was triggered. That is what lets one run (started by a branch
-# push) build a commit and still release it when a tag points at it.
+# Prints the release tag for a commit, querying the REMOTE rather than local tags.
 #
 #   resolve_release_tag <commit-sha> [remote]      (remote defaults to origin)
 #
 # - prints "v<Cargo.toml version>" if that tag points at the commit;
-# - prints nothing (success) if no v* tag points at it: an ordinary build;
-# - prints an error and fails if a v* tag points at it but none matches the
-#   Cargo.toml version, so a mistyped tag cannot publish the wrong release.
-#
-# `git ls-remote` lists an annotated tag twice: the tag object's own id, then the
-# commit it points at on a line ending in "^{}". The commit is what has to match.
+# - prints nothing (status 0) if no v* tag points at it (regular build);
+# - prints an error and returns 1 if tags exist but do not match Cargo.toml version.
 resolve_release_tag() {
-  local sha="$1" remote="${2:-origin}" version refs tags expected
+  local input_ref="$1"
+  local remote="${2:-origin}"
+  local full_sha version refs tags expected
 
-  version=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "${_REPO_ROOT}/Cargo.toml" | head -n1)
-  if [ -z "$version" ]; then
-    echo "::error::Could not find version in Cargo.toml" >&2
+  if [ -z "$input_ref" ]; then
+    _ci_error "resolve_release_tag requires a commit SHA or ref"
     return 1
   fi
 
-  # Fail loudly if the remote cannot be asked. Inside `$(...)` a failure is not
-  # fatal even under `set -e`, so an unreachable remote would otherwise look
-  # exactly like "no tag" and quietly skip a release.
-  refs=$(git ls-remote --tags "$remote" 'refs/tags/v*') || {
-    echo "::error::Could not list the tags on '${remote}'" >&2
+  # Resolve input ref (branch, tag, HEAD, or short SHA) to a full 40-char SHA
+  full_sha=$(git -C "$_REPO_ROOT" rev-parse --verify "${input_ref}^{commit}" 2>/dev/null) || full_sha="$input_ref"
+
+  version=$(_extract_cargo_toml_key "${_REPO_ROOT}/Cargo.toml" "version") || {
+    _ci_error "Could not find 'version' in Cargo.toml"
     return 1
   }
 
-  tags=$(printf '%s\n' "$refs" | awk -v sha="$sha" '
+  # Fetch tag references from remote
+  refs=$(git ls-remote --tags "$remote" 'refs/tags/v*') || {
+    _ci_error "Could not list remote tags on '${remote}'"
+    return 1
+  }
+
+  # Match both lightweight tags and peeled annotated tags (^{})
+  tags=$(printf '%s\n' "$refs" | awk -v sha="$full_sha" '
     {
+      commit = $1
       name = $2
       sub(/^refs\/tags\//, "", name)
       if (name ~ /\^\{\}$/) {
         sub(/\^\{\}$/, "", name)
-        peeled[name] = $1
+        peeled[name] = commit
       } else {
-        direct[name] = $1
+        direct[name] = commit
       }
     }
     END {
       for (n in direct) {
-        commit = (n in peeled) ? peeled[n] : direct[n]
-        if (commit == sha) print n
+        c = (n in peeled) ? peeled[n] : direct[n]
+        if (c == sha) print n
       }
     }' | sort)
 
@@ -134,8 +208,11 @@ resolve_release_tag() {
 
   expected="v${version}"
   if ! printf '%s\n' "$tags" | grep -qx "$expected"; then
-    echo "::error::Commit ${sha} has the tag(s) $(echo $tags) but Cargo.toml says version ${version}, so the tag should be ${expected}." >&2
+    local tag_list
+    tag_list=$(printf '%s\n' "$tags" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    _ci_error "Commit ${input_ref} (${full_sha:0:8}) has tag(s) [${tag_list}], but Cargo.toml says version is ${version} (expected tag '${expected}')."
     return 1
   fi
+
   echo "$expected"
 }
