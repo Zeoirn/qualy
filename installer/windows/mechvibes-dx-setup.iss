@@ -11,7 +11,7 @@
 #endif
 
 #define MyAppName "qualy"
-#define MyAppDisplayName "MechvibesDX (Qualy)"
+#define MyAppDisplayName "Qualy"
 #define MyAppVersion AppVersion
 #define MyAppPublisher "Hai Nguyen"
 #define MyAppURL "https://github.com/Zeoirn/qualy"
