@@ -14,7 +14,7 @@ use tokio::time::{interval, Duration as TokioDuration};
 
 // Fixed repository information
 const REPO_OWNER: &str = "zeoirn";
-const REPO_NAME: &str = "quly";
+const REPO_NAME: &str = "qualy";
 const API_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
