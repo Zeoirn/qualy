@@ -1,42 +1,25 @@
-[application]
-name = "qualy"
-out_dir = "bundle"
-asset_dir = "assets"
+/// Application constants used throughout the application
+/// This file centralizes all application naming and branding constants
 
-[application.desktop]
-bundle_assets = true
+/// The display name of the application (with proper casing)
+pub const APP_NAME: &str = "Qualy";
 
-[bundle]
-identifier = "com.hainguyents13.qualy"
-name = "Qualy"
-version = "0.4.0"
-publisher = "Hai Nguyen"
-icon = ["./assets/icon.ico"]
-category = "Productivity"
-short_description = "Qualy"
-long_description = "Qualy is a modern, cross-platform interactive sound simulator for keyboard, mouse, and other input devices."
-resources = [
-  "./soundpacks/keyboard",
-  "./soundpacks/mouse",
-  "./soundpacks/keyboard/cherrymx-black-abs",
-  "./soundpacks/keyboard/cherrymx-black-pbt",
-  "./soundpacks/keyboard/cherrymx-blue-abs",
-  "./soundpacks/keyboard/cherrymx-blue-pbt",
-  "./soundpacks/keyboard/cherrymx-brown-abs",
-  "./soundpacks/keyboard/cherrymx-brown-pbt",
-  "./soundpacks/keyboard/cherrymx-red-abs",
-  "./soundpacks/keyboard/eg-crystal-purple",
-  "./soundpacks/keyboard/eg-oreo",
-  "./soundpacks/keyboard/topre-purple-hybrid-pbt",
-  "./soundpacks/mouse/chat",
-  "./soundpacks/mouse/ping",
-  "./soundpacks/mouse/vibrate",
-  "./soundpacks/mouse/wooden",
-  "./assets",
-]
+/// The display name with spaces for better readability
+pub const APP_NAME_DISPLAY: &str = "Qualy";
 
-[bundle.windows]
-icon_path = "./assets/icon.ico"
-webview_install_mode = "Skip"
-tsp = false
-allow_downgrades = true
+/// The lowercase version for file names, URLs, etc.
+#[allow(dead_code)]
+pub const APP_NAME_LOWERCASE: &str = "qualy";
+
+/// The identifier for the application (used in protocol registration, etc.)
+#[allow(dead_code)]
+pub const APP_IDENTIFIER: &str = "com.hainguyents13.qualy";
+
+/// The protocol scheme for deep linking
+pub const APP_PROTOCOL: &str = "qualy";
+
+/// Version of the application (should match Cargo.toml)
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// CSS ID prefix for custom styles
+pub const CSS_ID_PREFIX: &str = "qualy";
