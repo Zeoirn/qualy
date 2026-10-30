@@ -13,7 +13,7 @@ pub const APP_NAME_LOWERCASE: &str = "qualy";
 
 /// The identifier for the application (used in protocol registration, etc.)
 #[allow(dead_code)]
-pub const APP_IDENTIFIER: &str = "com.hainguyents13.qualy";
+pub const APP_IDENTIFIER: &str = "com.zurai02.zeoirn";
 
 /// The protocol scheme for deep linking
 pub const APP_PROTOCOL: &str = "qualy";
