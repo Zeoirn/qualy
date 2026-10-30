@@ -13,8 +13,8 @@ use std::fmt;
 use tokio::time::{interval, Duration as TokioDuration};
 
 // Fixed repository information
-const REPO_OWNER: &str = "hainguyents13";
-const REPO_NAME: &str = "mechvibes-dx";
+const REPO_OWNER: &str = "zeoirn";
+const REPO_NAME: &str = "quly";
 const API_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
