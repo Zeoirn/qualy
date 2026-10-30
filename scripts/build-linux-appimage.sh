@@ -1,266 +1,153 @@
-#!/usr/bin/env bash
-#
-# Assemble AppDir/ and package it as an AppImage.
-#
-# Usage: ./scripts/build-linux-appimage.sh <version> [--skip-build] [--no-deb]
-#   e.g. ./scripts/build-linux-appimage.sh 0.8.0
-#
-# Builds target/release/mechvibes-dx (cargo build --release --locked), then
-# produces BOTH Linux packages from that one binary:
-#   dist/mechvibes-dx_<version>_amd64.deb         (needs cargo-deb installed)
-#   dist/mechvibes-dx-<version>-x86_64.AppImage
-# Each is checked after it is built.
-#
-#   --skip-build  reuse an existing binary instead of building one.
-#   --no-deb      skip the .deb, for a machine without cargo-deb.
-#
-# The AppDir deliberately mirrors the .deb's filesystem layout - usr/bin,
-# usr/share/mechvibes-dx/soundpacks - so that one binary serves both packages
-# and src/state/paths.rs needs only a single extra branch rather than a
-# separate AppImage code path. Two placements are NOT free choices:
-#
-#   usr/lib/mechvibes-dx/assets   dioxus-asset-resolver's Linux branch looks
-#                                 for <exe>/../../lib/<dir>/assets and takes
-#                                 the first entry containing an assets/ dir.
-#                                 Put the fonts anywhere else and every
-#                                 asset!() font silently 404s at runtime.
-#
-#   AppDir root .desktop + icon   appimagetool requires both at the top level;
-#                                 the copies under usr/share are what a
-#                                 desktop-integration helper installs later.
+; ==============================================================================
+; Qualy Inno Setup Script
+; Requires Inno Setup 6.0 or later: https://jrsoftware.org/isinfo.php
+;
+; Build invocation:
+;   ISCC.exe /DAppVersion=0.5.2 installer\windows\qualy-setup.iss
+; ==============================================================================
 
-set -euo pipefail
+#ifndef AppVersion
+  #error AppVersion must be defined, e.g. ISCC /DAppVersion=0.5.2 qualy-setup.iss
+#endif
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+#define MyAppName "qualy"
+#define MyAppDisplayName "Qualy"
+#define MyAppVersion AppVersion
+#define MyAppPublisher "Hai Nguyen"
+#define MyAppURL "https://github.com/Zeoirn/qualy"
+#define MyAppExeName "qualy.exe"
+#define MyAppId "{{8B5F5E5E-5E5E-5E5E-5E5E-5E5E5E5E5E5E}}"
 
-SKIP_BUILD=0
-BUILD_DEB=1
-VERSION=""
-for arg in "$@"; do
-  case "$arg" in
-    --skip-build) SKIP_BUILD=1 ;;
-    --no-deb) BUILD_DEB=0 ;;
-    -*) echo "unknown option: $arg" >&2; exit 2 ;;
-    *) VERSION="$arg" ;;
-  esac
-done
-if [ -z "$VERSION" ]; then
-  echo "usage: build-linux-appimage.sh <version> [--skip-build] [--no-deb]" >&2
-  exit 2
-fi
+[Setup]
+AppId={#MyAppId}
+AppName={#MyAppDisplayName}
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}/issues
+AppUpdatesURL={#MyAppURL}/releases
 
-APP_NAME="mechvibes-dx"
-ARCH="x86_64"
-BINARY="target/release/${APP_NAME}"
-APPDIR="build/AppDir"
-OUTPUT="dist/${APP_NAME}-${VERSION}-${ARCH}.AppImage"
+; Installation directory: C:\Users\<User>\AppData\Local\Programs\Qualy
+DefaultDirName={autopf}\{#MyAppDisplayName}
+DefaultGroupName={#MyAppDisplayName}
+DisableProgramGroupPage=yes
+DisableWelcomePage=no
+AllowNoIcons=yes
 
-# Fail first, and with a clear message, if the Rust in use is older than the
-# `rust-version` declared in Cargo.toml.
-verify_rust_toolchain
+; Binary & UI branding
+LicenseFile=..\..\LICENSE
+OutputDir=..\..\dist
+; Matches in-app auto-updater filter (must contain "x64" and end in ".exe")
+OutputBaseFilename=Qualy-{#MyAppVersion}-Setup-x64
+SetupIconFile=..\..\assets\icon.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
+WizardStyle=modern
 
-# Build step. The release binary is built here by default so a wrong toolchain
-# compiler older than `rust-version` in Cargo.toml, or a stale Cargo.lock,
-# fails at the start, with cargo's own message, instead of surfacing later.
-# `--locked` refuses to modify Cargo.lock.
-#
-# With --skip-build the caller has already built the binary (CI does, once, and
-# shares it between packages). Nothing is compiled here, so run a plain
-# `cargo check --locked` to still validate the pin and the lockfile.
-if [ "$SKIP_BUILD" -eq 1 ]; then
-  echo "Skipping build (--skip-build); checking the crate against the pinned toolchain..."
-  if ! cargo check --locked; then
-    echo "::error::'cargo check --locked' failed - check the Rust version against rust-version in Cargo.toml, or Cargo.lock"
-    exit 1
-  fi
-else
-  echo "Building release binary..."
-  cargo build --release --locked
-fi
+; Compression
+Compression=lzma2/max
+SolidCompression=yes
 
-if [ ! -f "$BINARY" ]; then
-  echo "::error::$BINARY not found - run without --skip-build to build it"
-  exit 1
-fi
+; Privileges & Architecture
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64compatible
 
-# --skip-build packages whatever binary is already there, which could be left
-# over from an older checkout. Refuse a binary older than anything it is built
-# from, rather than ship stale code under a new version number. Rebuild it, or
-# run without --skip-build.
-if [ "$SKIP_BUILD" -eq 1 ]; then
-  stale=$({ find src assets patches Cargo.toml Cargo.lock build.rs -type f -newer "$BINARY" 2>/dev/null || true; } | head -5)
-  if [ -n "$stale" ]; then
-    echo "::error::$BINARY is older than these files - rebuild it, or run without --skip-build:"
-    echo "$stale"
-    exit 1
-  fi
-fi
+; Restart Manager (strictly targets qualy.exe)
+CloseApplications=yes
+CloseApplicationsFilter={#MyAppExeName}
+RestartApplications=yes
 
-# --- .deb -------------------------------------------------------------------
-# Built from the same binary as the AppImage (--no-build: cargo-deb's own build
-# would not reuse it, and the file list lives in [package.metadata.deb] in
-# Cargo.toml). The package deliberately has no maintainer scripts, so it does
-# NOT add the user to the `input` group - the release notes say so. cargo-deb
-# leaves the binary unstripped and byte-identical, so the same BuildID ends up
-# in the AppImage below.
-if [ "$BUILD_DEB" -eq 1 ]; then
-  if ! command -v cargo-deb >/dev/null 2>&1; then
-    echo "::error::cargo-deb not found - install it ('cargo install cargo-deb') or pass --no-deb"
-    exit 1
-  fi
-  echo "=== Building .deb ==="
-  cargo deb --no-build
-  DEB_SOURCE=$(ls target/debian/"${APP_NAME}"_"${VERSION}"*.deb 2>/dev/null | head -1 || true)
-  if [ -z "$DEB_SOURCE" ] || [ ! -f "$DEB_SOURCE" ]; then
-    echo "::error::No .deb produced for version ${VERSION} in target/debian/"
-    exit 1
-  fi
-  mkdir -p dist
-  cp "$DEB_SOURCE" "dist/${APP_NAME}_${VERSION}_amd64.deb"
-  echo "=== Built dist/${APP_NAME}_${VERSION}_amd64.deb ==="
-fi
+; Executable metadata
+VersionInfoVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppDisplayName} Setup
+VersionInfoProductName={#MyAppDisplayName}
 
-echo "=== Assembling AppDir for ${APP_NAME} ${VERSION} ==="
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
-rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin"
-mkdir -p "$APPDIR/usr/lib/${APP_NAME}"
-mkdir -p "$APPDIR/usr/share/${APP_NAME}"
-mkdir -p "$APPDIR/usr/share/applications"
-mkdir -p "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startup"; Description: "Run at Windows startup (minimized to tray)"; GroupDescription: "Additional options:"; Flags: unchecked
 
-# --- binary -----------------------------------------------------------------
-install -m 755 "$BINARY" "$APPDIR/usr/bin/${APP_NAME}"
+[Files]
+; Main executable
+Source: "..\..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
-# --- read-only resources ----------------------------------------------------
-cp -r soundpacks "$APPDIR/usr/share/${APP_NAME}/soundpacks"
-cp -r assets "$APPDIR/usr/lib/${APP_NAME}/assets"
+; Assets folder (required for Dioxus asset!() macro)
+Source: "..\..\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-# --- desktop entry ----------------------------------------------------------
-# Reuses the same file the .deb ships, so the two packages cannot drift apart.
-# It is already appimagetool-safe: `Categories=AudioVideo;` is a single main
-# category, which is what a prior attempt (commit 5222274) had to fix. Verified
-# rather than assumed - the assertion below fails the build if that regresses.
-if ! grep -q '^Categories=AudioVideo;$' mechvibes-dx.desktop; then
-  echo "::error::mechvibes-dx.desktop must keep a single main category (Categories=AudioVideo;)"
-  echo "  found: $(grep '^Categories=' mechvibes-dx.desktop || echo '<none>')"
-  exit 1
-fi
-cp mechvibes-dx.desktop "$APPDIR/usr/share/applications/${APP_NAME}.desktop"
-cp mechvibes-dx.desktop "$APPDIR/${APP_NAME}.desktop"
+; Built-in soundpacks
+Source: "..\..\soundpacks\*"; DestDir: "{app}\soundpacks"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-cp assets/icon.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/${APP_NAME}.png"
-cp assets/icon.png "$APPDIR/${APP_NAME}.png"
-# .DirIcon is what file managers read for the image's own thumbnail.
-cp assets/icon.png "$APPDIR/.DirIcon"
+[Icons]
+; Start Menu shortcut
+Name: "{autoprograms}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0
 
-# --- AppRun -----------------------------------------------------------------
-# Kept minimal on purpose. It does NOT bundle or preload system libraries:
-# webkit2gtk, GTK and libasound come from the host, which is the standard
-# trade-off for a webview app (a bundled webkit conflicts with the host's
-# GStreamer and portal stack more often than it helps).
-#
-# APPDIR is exported because the AppImage runtime does so and tooling expects
-# it, but the app itself does not read it - paths.rs derives the AppDir from
-# the executable's own location, which an inherited stale env var cannot spoof.
-cat > "$APPDIR/AppRun" <<'APPRUN'
-#!/usr/bin/env bash
-set -eu
-HERE="$(dirname "$(readlink -f "${0}")")"
-export APPDIR="${HERE}"
-export PATH="${HERE}/usr/bin:${PATH}"
-export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-exec "${HERE}/usr/bin/mechvibes-dx" "$@"
-APPRUN
-chmod 755 "$APPDIR/AppRun"
+; Desktop shortcut
+Name: "{autodesktop}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: desktopicon
 
-# --- guard: resources must match the source tree ----------------------------
-# A non-zero check is not enough. The four mouse packs are .mp3 while the
-# keyboard packs are .ogg, so an .ogg-only count would pass while silently
-# dropping every mouse pack - this exact hole was found during the macOS round.
-count_audio() {
-  find "$1" -type f \( -name '*.ogg' -o -name '*.mp3' -o -name '*.wav' \) | wc -l
-}
-count_configs() {
-  find "$1" -type f -name 'config.json' | wc -l
-}
+[Registry]
+; Windows startup registration
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppDisplayName}"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Flags: uninsdeletekey
 
-SRC_AUDIO=$(count_audio soundpacks)
-APP_AUDIO=$(count_audio "$APPDIR/usr/share/${APP_NAME}/soundpacks")
-SRC_CONFIGS=$(count_configs soundpacks)
-APP_CONFIGS=$(count_configs "$APPDIR/usr/share/${APP_NAME}/soundpacks")
-SRC_FONTS=$(find assets/fonts -type f -name '*.ttf' | wc -l)
-APP_FONTS=$(find "$APPDIR/usr/lib/${APP_NAME}/assets/fonts" -type f -name '*.ttf' | wc -l)
+[Run]
+; Interactive installs: launch checkbox on final page
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppDisplayName}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
-if [ "$SRC_AUDIO" -ne "$APP_AUDIO" ] || [ "$SRC_AUDIO" -eq 0 ]; then
-  echo "::error::soundpack audio mismatch: AppDir has $APP_AUDIO, source tree has $SRC_AUDIO"
-  exit 1
-fi
-if [ "$SRC_CONFIGS" -ne "$APP_CONFIGS" ] || [ "$SRC_CONFIGS" -eq 0 ]; then
-  echo "::error::soundpack config.json mismatch: AppDir has $APP_CONFIGS, source tree has $SRC_CONFIGS"
-  exit 1
-fi
-if [ "$SRC_FONTS" -ne "$APP_FONTS" ] || [ "$SRC_FONTS" -eq 0 ]; then
-  echo "::error::font mismatch: AppDir has $APP_FONTS, source tree has $SRC_FONTS"
-  exit 1
-fi
+; Silent installs (Auto-updater): relaunch under user session
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Flags: nowait runasoriginaluser skipifnotsilent
 
-echo "Bundled $APP_AUDIO soundpack audio files (matches source tree)"
-echo "Bundled $APP_CONFIGS soundpack config.json files (matches source tree)"
-echo "Bundled $APP_FONTS fonts (matches source tree)"
+[UninstallDelete]
+; Clean up app runtime caches
+Type: filesandordirs; Name: "{app}\data"
+Type: filesandordirs; Name: "{localappdata}\{#MyAppName}"
 
-# --- appimagetool -----------------------------------------------------------
-# GitHub runners have no FUSE, so appimagetool cannot mount *itself* to run.
-# APPIMAGE_EXTRACT_AND_RUN=1 makes it unpack to a temp dir and exec from there
-# instead, which is the supported workaround and needs no privileges.
-TOOL="build/appimagetool-${ARCH}.AppImage"
-if [ ! -f "$TOOL" ]; then
-  echo "=== Downloading appimagetool ==="
-  mkdir -p build
-  curl -fsSL -o "$TOOL" \
-    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
-  chmod +x "$TOOL"
-fi
+[Code]
+procedure SHChangeNotify(wEventId: LongInt; uFlags: Cardinal; dwItem1, dwItem2: Cardinal);
+  external 'SHChangeNotify@shell32.dll stdcall';
 
-mkdir -p dist
-echo "=== Packaging ${OUTPUT} ==="
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "./$TOOL" --no-appstream "$APPDIR" "$OUTPUT"
+const
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST       = $00000000;
 
-chmod +x "$OUTPUT"
-echo "=== Built $OUTPUT ($(du -h "$OUTPUT" | cut -f1)) ==="
+procedure RefreshIconCache();
+begin
+  try
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+  except
+  end;
+end;
 
-# --- verify the finished image ----------------------------------------------
-# Unpack it and walk it, so the build log is itself the evidence that the
-# shipped artifact has the right shape. A green exit from the steps above only
-# proves the commands ran.
-echo "=== Verifying $OUTPUT ==="
-VERIFY_DIR="build/verify"
-rm -rf "$VERIFY_DIR"
-mkdir -p "$VERIFY_DIR"
-OUTPUT_ABS="$(cd "$(dirname "$OUTPUT")" && pwd)/$(basename "$OUTPUT")"
-(cd "$VERIFY_DIR" && "$OUTPUT_ABS" --appimage-extract >/dev/null)
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    // Create custom soundpacks folder in AppData/Roaming/qualy
+    CreateDir(ExpandConstant('{userappdata}\{#MyAppName}\soundpacks\keyboard'));
+    CreateDir(ExpandConstant('{userappdata}\{#MyAppName}\soundpacks\mouse'));
 
-IMG="$VERIFY_DIR/squashfs-root"
-echo "--- AppDir tree (depth 4) ---"
-find "$IMG" -maxdepth 4 | sort
+    RefreshIconCache();
+  end;
+end;
 
-IMG_AUDIO=$(count_audio "$IMG/usr/share/${APP_NAME}/soundpacks")
-IMG_CFG=$(count_configs "$IMG/usr/share/${APP_NAME}/soundpacks")
-IMG_FONTS=$(find "$IMG/usr/lib/${APP_NAME}/assets/fonts" -type f -name '*.ttf' | wc -l)
-echo "soundpack audio: image=$IMG_AUDIO source=$SRC_AUDIO"
-echo "soundpack config.json: image=$IMG_CFG source=$SRC_CONFIGS"
-echo "fonts: image=$IMG_FONTS source=$SRC_FONTS"
-[ "$IMG_AUDIO" -eq "$SRC_AUDIO" ] && [ "$IMG_AUDIO" -gt 0 ] \
-  || { echo "::error::AppImage soundpack audio does not match the source tree"; exit 1; }
-[ "$IMG_CFG" -eq "$SRC_CONFIGS" ] && [ "$IMG_CFG" -gt 0 ] \
-  || { echo "::error::AppImage soundpack config.json does not match the source tree"; exit 1; }
-[ "$IMG_FONTS" -eq "$SRC_FONTS" ] && [ "$IMG_FONTS" -gt 0 ] \
-  || { echo "::error::AppImage fonts do not match the source tree"; exit 1; }
-
-# ELF magic checked byte-wise rather than trusting `file`'s wording.
-[ "$(head -c 4 "$IMG/usr/bin/${APP_NAME}" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
-  || { echo "::error::bundled executable is not an ELF binary"; exit 1; }
-echo "ELF magic OK"
-rm -rf "$VERIFY_DIR"
-
-assert_no_updater_collision dist
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  DataPath: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    DataPath := ExpandConstant('{userappdata}\{#MyAppName}');
+    
+    if not UninstallSilent and DirExists(DataPath) then
+    begin
+      if MsgBox('Do you want to remove all custom soundpacks and user settings in ' + DataPath + '?', mbConfirmation, MB_YESNO) = IDYES then
+      begin
+        DelTree(DataPath, True, True, True);
+      end;
+    end;
+    
+    RefreshIconCache();
+  end;
+end;

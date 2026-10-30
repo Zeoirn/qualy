@@ -1,45 +1,59 @@
 #!/usr/bin/env bash
 #
-# Assemble MechvibesDX.app and package it as a compressed DMG.
+# Assemble AppDir/ and package it as an AppImage.
 #
-# `dx bundle` is deliberately NOT used: DioxusLabs/dioxus#5723 makes the 0.7.x
-# resource copier fail on every directory entry in Dioxus.toml's `resources`,
-# and worse, it exits non-zero having already produced a .app with an EMPTY
-# Contents/Resources. Hand-assembly is fully specified and verifiable, so it is
-# what ships until that fix lands (confirmed present in 0.8.0-alpha.1).
+# Usage: ./scripts/build-linux-appimage.sh <version> [--skip-build] [--no-deb]
+#   e.g. ./scripts/build-linux-appimage.sh 0.8.0
 #
-# Usage: scripts/build-macos-app.sh <version> [--skip-build]
-#   Builds target/release/mechvibes-dx (cargo build --release --locked) first.
-#   --skip-build reuses an existing binary, e.g. when CI built it already.
-#   Writes dist/mechvibes-dx-<version>-macos-<arch>.dmg
+# Builds target/release/qualy (cargo build --release --locked), then
+# produces BOTH Linux packages from that one binary:
+#   dist/qualy_<version>_amd64.deb         (needs cargo-deb installed)
+#   dist/qualy-<version>-x86_64.AppImage
+# Each is checked after it is built.
 #
-# macOS only (uses sips, iconutil, codesign, hdiutil).
+#   --skip-build  reuse an existing binary instead of building one.
+#   --no-deb      skip the .deb, for a machine without cargo-deb.
+#
+# The AppDir deliberately mirrors the .deb's filesystem layout - usr/bin,
+# usr/share/qualy/soundpacks - so that one binary serves both packages
+# and src/state/paths.rs needs only a single extra branch rather than a
+# separate AppImage code path. Two placements are NOT free choices:
+#
+#   usr/lib/qualy/assets   dioxus-asset-resolver's Linux branch looks
+#                                 for <exe>/../../lib/<dir>/assets and takes
+#                                 the first entry containing an assets/ dir.
+#                                 Put the fonts anywhere else and every
+#                                 asset!() font silently 404s at runtime.
+#
+#   AppDir root .desktop + icon   appimagetool requires both at the top level;
+#                                 the copies under usr/share are what a
+#                                 desktop-integration helper installs later.
 
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 SKIP_BUILD=0
+BUILD_DEB=1
 VERSION=""
 for arg in "$@"; do
   case "$arg" in
     --skip-build) SKIP_BUILD=1 ;;
+    --no-deb) BUILD_DEB=0 ;;
     -*) echo "unknown option: $arg" >&2; exit 2 ;;
     *) VERSION="$arg" ;;
   esac
 done
 if [ -z "$VERSION" ]; then
-  echo "usage: build-macos-app.sh <version> [--skip-build]" >&2
+  echo "usage: build-linux-appimage.sh <version> [--skip-build] [--no-deb]" >&2
   exit 2
 fi
-ARCH=$(uname -m)
 
-APP_NAME="MechvibesDX"
-BUNDLE="dist/${APP_NAME}.app"
-BINARY="target/release/mechvibes-dx"
-IDENTIFIER="com.hainguyents13.mechvibesdx"
-# arm64 macOS starts at 11.0; nothing older can run an Apple Silicon build.
-MIN_MACOS="11.0"
+APP_NAME="qualy"
+ARCH="x86_64"
+BINARY="target/release/${APP_NAME}"
+APPDIR="build/AppDir"
+OUTPUT="dist/${APP_NAME}-${VERSION}-${ARCH}.AppImage"
 
 # Fail first, and with a clear message, if the Rust in use is older than the
 # `rust-version` declared in Cargo.toml.
@@ -82,190 +96,168 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
   fi
 fi
 
-rm -rf dist staging
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+# --- .deb -------------------------------------------------------------------
+# Built from the same binary as the AppImage (--no-build: cargo-deb's own build
+# would not reuse it, and the file list lives in [package.metadata.deb] in
+# Cargo.toml). The package deliberately has no maintainer scripts, so it does
+# NOT add the user to the `input` group - the release notes say so. cargo-deb
+# leaves the binary unstripped and byte-identical, so the same BuildID ends up
+# in the AppImage below.
+if [ "$BUILD_DEB" -eq 1 ]; then
+  if ! command -v cargo-deb >/dev/null 2>&1; then
+    echo "::error::cargo-deb not found - install it ('cargo install cargo-deb') or pass --no-deb"
+    exit 1
+  fi
+  echo "=== Building .deb ==="
+  cargo deb --no-build
+  DEB_SOURCE=$(ls target/debian/"${APP_NAME}"_"${VERSION}"*.deb 2>/dev/null | head -1 || true)
+  if [ -z "$DEB_SOURCE" ] || [ ! -f "$DEB_SOURCE" ]; then
+    echo "::error::No .deb produced for version ${VERSION} in target/debian/"
+    exit 1
+  fi
+  mkdir -p dist
+  cp "$DEB_SOURCE" "dist/${APP_NAME}_${VERSION}_amd64.deb"
+  echo "=== Built dist/${APP_NAME}_${VERSION}_amd64.deb ==="
+fi
 
-# ---------------------------------------------------------------------------
-# 1. Executable
-# ---------------------------------------------------------------------------
-cp "$BINARY" "$BUNDLE/Contents/MacOS/mechvibes-dx"
-chmod +x "$BUNDLE/Contents/MacOS/mechvibes-dx"
+echo "=== Assembling AppDir for ${APP_NAME} ${VERSION} ==="
 
-# ---------------------------------------------------------------------------
-# 2. Resources
+rm -rf "$APPDIR"
+mkdir -p "$APPDIR/usr/bin"
+mkdir -p "$APPDIR/usr/lib/${APP_NAME}"
+mkdir -p "$APPDIR/usr/share/${APP_NAME}"
+mkdir -p "$APPDIR/usr/share/applications"
+mkdir -p "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+
+# --- binary -----------------------------------------------------------------
+install -m 755 "$BINARY" "$APPDIR/usr/bin/${APP_NAME}"
+
+# --- read-only resources ----------------------------------------------------
+cp -r soundpacks "$APPDIR/usr/share/${APP_NAME}/soundpacks"
+cp -r assets "$APPDIR/usr/lib/${APP_NAME}/assets"
+
+# --- desktop entry ----------------------------------------------------------
+# Reuses the same file the .deb ships, so the two packages cannot drift apart.
+# It is already appimagetool-safe: `Categories=AudioVideo;` is a single main
+# category, which is what a prior attempt (commit 5222274) had to fix. Verified
+# rather than assumed - the assertion below fails the build if that regresses.
+if ! grep -q '^Categories=AudioVideo;$' qualy.desktop; then
+  echo "::error::qualy.desktop must keep a single main category (Categories=AudioVideo;)"
+  echo "  found: $(grep '^Categories=' qualy.desktop || echo '<none>')"
+  exit 1
+fi
+cp qualy.desktop "$APPDIR/usr/share/applications/${APP_NAME}.desktop"
+cp qualy.desktop "$APPDIR/${APP_NAME}.desktop"
+
+cp assets/icon.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/${APP_NAME}.png"
+cp assets/icon.png "$APPDIR/${APP_NAME}.png"
+# .DirIcon is what file managers read for the image's own thumbnail.
+cp assets/icon.png "$APPDIR/.DirIcon"
+
+# --- AppRun -----------------------------------------------------------------
+# Kept minimal on purpose. It does NOT bundle or preload system libraries:
+# webkit2gtk, GTK and libasound come from the host, which is the standard
+# trade-off for a webview app (a bundled webkit conflicts with the host's
+# GStreamer and portal stack more often than it helps).
 #
-# `soundpacks/` is what src/state/paths.rs resolves via ../Resources when it
-# detects the bundle layout. `assets/` must ALSO be here because
-# dioxus-asset-resolver hardcodes Contents/Resources as the asset root on
-# macOS - without it every asset!() font and icon 404s at runtime.
-# ---------------------------------------------------------------------------
-cp -R soundpacks "$BUNDLE/Contents/Resources/"
-cp -R assets "$BUNDLE/Contents/Resources/"
-cp README-macos.txt "$BUNDLE/Contents/Resources/"
+# APPDIR is exported because the AppImage runtime does so and tooling expects
+# it, but the app itself does not read it - paths.rs derives the AppDir from
+# the executable's own location, which an inherited stale env var cannot spoof.
+cat > "$APPDIR/AppRun" <<'APPRUN'
+#!/usr/bin/env bash
+set -eu
+HERE="$(dirname "$(readlink -f "${0}")")"
+export APPDIR="${HERE}"
+export PATH="${HERE}/usr/bin:${PATH}"
+export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec "${HERE}/usr/bin/qualy" "$@"
+APPRUN
+chmod 755 "$APPDIR/AppRun"
 
-# The failure mode this job already shipped once: an archive whose Resources
-# were silently empty. Assert instead of trusting the copy.
-#
-# Compared against the source tree rather than a hardcoded number, and counting
-# every audio extension - the mouse packs are .mp3, so an .ogg-only check would
-# pass while silently dropping all four of them. A count mismatch means the
-# copy lost files.
-count_audio() { find "$1" \( -name "*.ogg" -o -name "*.mp3" -o -name "*.wav" \) | wc -l | tr -d ' '; }
-expected=$(count_audio soundpacks)
-packs=$(count_audio "$BUNDLE/Contents/Resources/soundpacks")
-if [ "$packs" -eq 0 ]; then
-  echo "::error::No soundpacks in the bundle - refusing to ship a silent app"
+# --- guard: resources must match the source tree ----------------------------
+count_audio() {
+  find "$1" -type f \( -name '*.ogg' -o -name '*.mp3' -o -name '*.wav' \) | wc -l
+}
+count_configs() {
+  find "$1" -type f -name 'config.json' | wc -l
+}
+
+SRC_AUDIO=$(count_audio soundpacks)
+APP_AUDIO=$(count_audio "$APPDIR/usr/share/${APP_NAME}/soundpacks")
+SRC_CONFIGS=$(count_configs soundpacks)
+APP_CONFIGS=$(count_configs "$APPDIR/usr/share/${APP_NAME}/soundpacks")
+SRC_FONTS=$(find assets/fonts -type f -name '*.ttf' | wc -l)
+APP_FONTS=$(find "$APPDIR/usr/lib/${APP_NAME}/assets/fonts" -type f -name '*.ttf' | wc -l)
+
+if [ "$SRC_AUDIO" -ne "$APP_AUDIO" ] || [ "$SRC_AUDIO" -eq 0 ]; then
+  echo "::error::soundpack audio mismatch: AppDir has $APP_AUDIO, source tree has $SRC_AUDIO"
   exit 1
 fi
-if [ "$packs" -ne "$expected" ]; then
-  echo "::error::Bundled $packs soundpack audio files but the source tree has $expected"
+if [ "$SRC_CONFIGS" -ne "$APP_CONFIGS" ] || [ "$SRC_CONFIGS" -eq 0 ]; then
+  echo "::error::soundpack config.json mismatch: AppDir has $APP_CONFIGS, source tree has $SRC_CONFIGS"
   exit 1
 fi
-echo "Bundled $packs soundpack audio files (matches source tree)"
-
-# Every built-in pack listed in src/state/paths.rs must have its config.json,
-# or that pack silently fails to load at runtime.
-configs=$(find "$BUNDLE/Contents/Resources/soundpacks" -name "config.json" | wc -l | tr -d ' ')
-expected_configs=$(find soundpacks -name "config.json" | wc -l | tr -d ' ')
-if [ "$configs" -ne "$expected_configs" ]; then
-  echo "::error::Bundled $configs soundpack config.json files, expected $expected_configs"
-  exit 1
-fi
-echo "Bundled $configs soundpack config.json files"
-
-if [ ! -d "$BUNDLE/Contents/Resources/assets/fonts" ]; then
-  echo "::error::assets/fonts missing from Resources - asset!() lookups would fail"
+if [ "$SRC_FONTS" -ne "$APP_FONTS" ] || [ "$SRC_FONTS" -eq 0 ]; then
+  echo "::error::font mismatch: AppDir has $APP_FONTS, source tree has $SRC_FONTS"
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 3. Icon: generate .icns on the runner from the repo's 512x512 PNG.
-# ---------------------------------------------------------------------------
-ICONSET="staging/${APP_NAME}.iconset"
-mkdir -p "$ICONSET"
-for size in 16 32 128 256 512; do
-  sips -z $size $size assets/icon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-  double=$((size * 2))
-  sips -z $double $double assets/icon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$BUNDLE/Contents/Resources/${APP_NAME}.icns"
-echo "Generated ${APP_NAME}.icns"
+echo "Bundled $APP_AUDIO soundpack audio files (matches source tree)"
+echo "Bundled $APP_CONFIGS soundpack config.json files (matches source tree)"
+echo "Bundled $APP_FONTS fonts (matches source tree)"
 
-# ---------------------------------------------------------------------------
-# 4. Info.plist
-#
-# LSUIElement is NOT set: the app has a real window, and a tray-only agent
-# cannot be granted Accessibility permission through the normal UI flow.
-# NSMicrophoneUsageDescription is absent on purpose - the app only plays audio.
-# ---------------------------------------------------------------------------
-cat > "$BUNDLE/Contents/Info.plist" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleExecutable</key>
-    <string>mechvibes-dx</string>
-    <key>CFBundleIconFile</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleIdentifier</key>
-    <string>${IDENTIFIER}</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>CFBundleVersion</key>
-    <string>${VERSION}</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>${MIN_MACOS}</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-
-plutil -lint "$BUNDLE/Contents/Info.plist"
-
-# ---------------------------------------------------------------------------
-# 5. Ad-hoc signature.
-#
-# This is NOT notarization and NOT a Developer ID signature - it only makes the
-# bundle internally consistent so macOS will run it after the user clears
-# quarantine. `spctl` still rejects it, which is expected and NOT gated on.
-# ---------------------------------------------------------------------------
-codesign --force --deep -s - "$BUNDLE"
-codesign --verify --deep --strict --verbose=2 "$BUNDLE"
-echo "Ad-hoc signature verified"
-
-echo "--- Gatekeeper assessment (expected to FAIL: unsigned/not notarized) ---"
-spctl --assess --type execute --verbose=4 "$BUNDLE" || true
-echo "-----------------------------------------------------------------------"
-
-# ---------------------------------------------------------------------------
-# 6. DMG with an /Applications symlink so the user can drag-install.
-# ---------------------------------------------------------------------------
-DMG_ROOT="staging/dmg"
-mkdir -p "$DMG_ROOT"
-cp -R "$BUNDLE" "$DMG_ROOT/"
-ln -s /Applications "$DMG_ROOT/Applications"
-cp README-macos.txt "$DMG_ROOT/README.txt"
-
-# "arm64"/"x86_64" contain no "x64" substring and this is not a .exe, so the
-# Windows auto-updater filter in src/utils/auto_updater.rs cannot pick it up.
-DMG="dist/mechvibes-dx-${VERSION}-macos-${ARCH}.dmg"
-hdiutil create -volname "${APP_NAME}" -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"
-hdiutil verify "$DMG"
-
-# ---------------------------------------------------------------------------
-# 7. Mount the finished DMG and check what is actually inside it, so the build
-# log is itself the evidence that the shipped artifact has the right shape. A
-# green exit from the assembly steps only proves the commands ran.
-# ---------------------------------------------------------------------------
-echo "=== Verifying $DMG ($(du -h "$DMG" | cut -f1)) ==="
-MOUNT_POINT="$(mktemp -d)"
-trap 'hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true; rmdir "$MOUNT_POINT" 2>/dev/null || true' EXIT
-hdiutil attach "$DMG" -mountpoint "$MOUNT_POINT" -nobrowse -readonly -quiet
-
-MOUNTED_APP="$MOUNT_POINT/${APP_NAME}.app"
-[ -d "$MOUNTED_APP" ] || { echo "::error::DMG has no ${APP_NAME}.app"; exit 1; }
-[ -L "$MOUNT_POINT/Applications" ] || { echo "::error::DMG has no Applications symlink"; exit 1; }
-
-echo "--- bundle tree ---"
-find "$MOUNTED_APP" -maxdepth 3 | sort
-echo "--- binary ---"
-file "$MOUNTED_APP/Contents/MacOS/mechvibes-dx"
-file "$MOUNTED_APP/Contents/MacOS/mechvibes-dx" | grep -q "Mach-O" \
-  || { echo "::error::bundled executable is not a Mach-O binary"; exit 1; }
-
-DMG_AUDIO=$(count_audio "$MOUNTED_APP/Contents/Resources/soundpacks")
-if [ "$DMG_AUDIO" -ne "$expected" ]; then
-  echo "::error::DMG holds $DMG_AUDIO soundpack audio files but the source tree has $expected"
-  exit 1
+# --- appimagetool -----------------------------------------------------------
+# GitHub runners have no FUSE, so appimagetool cannot mount *itself* to run.
+# APPIMAGE_EXTRACT_AND_RUN=1 makes it unpack to a temp dir and exec from there
+# instead, which is the supported workaround and needs no privileges.
+TOOL="build/appimagetool-${ARCH}.AppImage"
+if [ ! -f "$TOOL" ]; then
+  echo "=== Downloading appimagetool ==="
+  mkdir -p build
+  curl -fsSL -o "$TOOL" \
+    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+  chmod +x "$TOOL"
 fi
-echo "soundpack audio in DMG: $DMG_AUDIO (matches source tree)"
 
-# Ad-hoc signature only. spctl is deliberately NOT gated on: it fails without
-# notarization, which is expected for this build.
-codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
+mkdir -p dist
+echo "=== Packaging ${OUTPUT} ==="
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "./$TOOL" --no-appstream "$APPDIR" "$OUTPUT"
 
-hdiutil detach "$MOUNT_POINT" -quiet
-rmdir "$MOUNT_POINT"
-trap - EXIT
+chmod +x "$OUTPUT"
+echo "=== Built $OUTPUT ($(du -h "$OUTPUT" | cut -f1)) ==="
 
-# Ship the bundle only inside the DMG.
-rm -rf "$BUNDLE"
-cp README-macos.txt "dist/README-macos-${VERSION}.txt"
+# --- verify the finished image ----------------------------------------------
+# Unpack it and walk it, so the build log is itself the evidence that the
+# shipped artifact has the right shape. A green exit from the steps above only
+# proves the commands ran.
+echo "=== Verifying $OUTPUT ==="
+VERIFY_DIR="build/verify"
+rm -rf "$VERIFY_DIR"
+mkdir -p "$VERIFY_DIR"
+OUTPUT_ABS="$(cd "$(dirname "$OUTPUT")" && pwd)/$(basename "$OUTPUT")"
+(cd "$VERIFY_DIR" && "$OUTPUT_ABS" --appimage-extract >/dev/null)
+
+IMG="$VERIFY_DIR/squashfs-root"
+echo "--- AppDir tree (depth 4) ---"
+find "$IMG" -maxdepth 4 | sort
+
+IMG_AUDIO=$(count_audio "$IMG/usr/share/${APP_NAME}/soundpacks")
+IMG_CFG=$(count_configs "$IMG/usr/share/${APP_NAME}/soundpacks")
+IMG_FONTS=$(find "$IMG/usr/lib/${APP_NAME}/assets/fonts" -type f -name '*.ttf' | wc -l)
+echo "soundpack audio: image=$IMG_AUDIO source=$SRC_AUDIO"
+echo "soundpack config.json: image=$IMG_CFG source=$SRC_CONFIGS"
+echo "fonts: image=$IMG_FONTS source=$SRC_FONTS"
+[ "$IMG_AUDIO" -eq "$SRC_AUDIO" ] && [ "$IMG_AUDIO" -gt 0 ] \
+  || { echo "::error::AppImage soundpack audio does not match the source tree"; exit 1; }
+[ "$IMG_CFG" -eq "$SRC_CONFIGS" ] && [ "$IMG_CFG" -gt 0 ] \
+  || { echo "::error::AppImage soundpack config.json does not match the source tree"; exit 1; }
+[ "$IMG_FONTS" -eq "$SRC_FONTS" ] && [ "$IMG_FONTS" -gt 0 ] \
+  || { echo "::error::AppImage fonts do not match the source tree"; exit 1; }
+
+# ELF magic checked byte-wise rather than trusting `file`'s wording.
+[ "$(head -c 4 "$IMG/usr/bin/${APP_NAME}" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
+  || { echo "::error::bundled executable is not an ELF binary"; exit 1; }
+echo "ELF magic OK"
+rm -rf "$VERIFY_DIR"
 
 assert_no_updater_collision dist
-
-echo "--- dist/ ---"
-ls -la dist/

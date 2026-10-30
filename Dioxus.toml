@@ -1,42 +1,137 @@
-[application]
-name = "mechvibes-dx"
-out_dir = "bundle"
-asset_dir = "assets"
+[package]
+name = "qualy"
+version = "0.8.4"
+authors = ["Hải Nguyễn <hainguyen.ts13@gmail.com>"]
+edition = "2024"
+rust-version = "1.88"
+description = "A modern keyboard and mouse sound simulator with customizable soundpacks"
+license = "MIT"
 
-[application.desktop]
-bundle_assets = true
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[bundle]
-identifier = "com.hainguyents13.mechvibesdx"
-name = "MechvibesDX"
-version = "0.4.0"
-publisher = "Hai Nguyen"
-icon = ["./assets/icon.ico"]
-category = "Productivity"
-short_description = "MechvibesDX"
-long_description = "MechvibesDX is a modern, cross-platform interactive sound simulator for keyboard, mouse, and other input devices."
-resources = [
-  "./soundpacks/keyboard",
-  "./soundpacks/mouse",
-  "./soundpacks/keyboard/cherrymx-black-abs",
-  "./soundpacks/keyboard/cherrymx-black-pbt",
-  "./soundpacks/keyboard/cherrymx-blue-abs",
-  "./soundpacks/keyboard/cherrymx-blue-pbt",
-  "./soundpacks/keyboard/cherrymx-brown-abs",
-  "./soundpacks/keyboard/cherrymx-brown-pbt",
-  "./soundpacks/keyboard/cherrymx-red-abs",
-  "./soundpacks/keyboard/eg-crystal-purple",
-  "./soundpacks/keyboard/eg-oreo",
-  "./soundpacks/keyboard/topre-purple-hybrid-pbt",
-  "./soundpacks/mouse/chat",
-  "./soundpacks/mouse/ping",
-  "./soundpacks/mouse/vibrate",
-  "./soundpacks/mouse/wooden",
-  "./assets",
+[dependencies]
+base64 = "0.22"
+bincode = "1.3.3"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+dioxus = { version = "0.7.10", features = ["router"] }
+uuid = { version = "1", features = ["v4"] }
+env_logger = "0.11.6"
+futures-timer = "3.0.3"
+lucide-dioxus = { version = "2.45.0", features = ["all-icons"] }
+once_cell = "1.21.3"
+open = "5.3.0"
+rand = "0.9.0"
+rdev = { version = "0.5.3", features = ["unstable_grab"] }
+# Use rfd from dioxus-desktop (0.15.4) with tokio instead of async-std
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rodio = "0.20.1"
+cpal = "0.15"
+hound = "3.5"
+rubato = "0.15"
+symphonia = { version = "0.5", features = [
+  "mp3",
+  "wav",
+  "ogg",
+  "isomp4",
+  "aac",
+] }
+image = "0.24"
+serde = "1.0.218"
+serde_json = "1.0.140"
+strum = { version = "0.26", features = ["derive"] }
+tray-icon = "0.14"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+semver = "1.0"
+zip = "2.2.0"
+device_query = "4.0.1"
+directories = "6.0.0"
+sha2 = "0.11.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macos-accessibility-client = "0.0.1"
+# Login-item registration via SMAppService (src/utils/auto_startup.rs).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSError", "NSString"] }
+# The block `NSColor` calls to ask for a colour per light/dark appearance
+# (src/libs/permissions.rs). Already in the dependency tree via dioxus.
+block2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+winapi = { version = "0.3", features = [
+  "wincon",
+  "winuser",
+  "hidusage",
+  "hidpi",
+  "setupapi",
+  "devguid",
+  "cfgmgr32",
+  "winreg",
+  "libloaderapi",
+  "errhandlingapi",
+  "synchapi",
+  "handleapi",
+  "winnls",
+  "processenv",
+  "winbase",
+] }
+
+
+[build-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1.0.140"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[features]
+default = ["dioxus/desktop", "auto-update"]
+desktop = ["dioxus/desktop"]
+auto-update = []
+
+[profile.dev]
+# Optimize audio performance in dev builds while keeping debug symbols
+opt-level = 2
+debug = true
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
+
+# DEB package configuration for Ubuntu/Debian
+[package.metadata.deb]
+maintainer = "Hải Nguyễn <hainguyen.ts13@gmail.com>"
+copyright = "2025, Hải Nguyễn <hainguyen.ts13@gmail.com>"
+extended-description = """\
+A modern keyboard and mouse sound simulator for Linux.
+Plays realistic keyboard and mouse sounds with customizable soundpacks."""
+depends = "$auto, libasound2, libevdev2, libxdo3"
+section = "sound"
+priority = "optional"
+# `usr/lib/qualy/assets` is the app asset root on Linux.
+assets = [
+  ["target/release/qualy", "usr/bin/", "755"],
+  ["assets/**/*", "usr/lib/qualy/assets/", "644"],
+  ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/qualy.png", "644"],
+  ["qualy.desktop", "usr/share/applications/", "644"],
+  ["README.md", "usr/share/doc/qualy/", "644"],
+  ["soundpacks/**/*", "usr/share/qualy/soundpacks/", "644"],
 ]
 
-[bundle.windows]
-icon_path = "./assets/icon.ico"
-webview_install_mode = "Skip"
-tsp = false
-allow_downgrades = true
+# Local patch: wraps rdev's TIS* API calls in dispatch::Queue::main().exec_sync()
+# to fix EXC_BREAKPOINT crash on macOS Sequoia+ (HIToolbox requires main queue).
+# Remove this once rdev publishes a release with the upstream fix.
+[patch.crates-io]
+rdev = { path = "patches/rdev" }

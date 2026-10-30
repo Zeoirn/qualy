@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Qualy
+GenericName=Keyboard Sound Simulator
+Comment=Mechanical keyboard sound simulator
+Icon=qualy
+Exec=qualy
+Terminal=false
+Categories=AudioVideo;
+Keywords=keyboard;sound;mechanical;simulator;
+StartupNotify=true
